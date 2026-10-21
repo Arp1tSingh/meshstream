@@ -85,7 +85,7 @@ with the same commands or the optional logon tasks below.
 | API (Fastify + SQLite) | 4000 | `/api/*`, `/hls/*` |
 | Signal (`ws`) | 4001 | `/ws/*` |
 | MediaMTX LL-HLS | 8888 (localhost) | proxied by API, never exposed |
-| MediaMTX WHIP | 8889 (localhost) | proxied by API, never exposed |
+| MediaMTX WHIP/WHEP | 8889 (localhost) | WHIP proxied by API; read-only `/webrtc/live/<id>/whep` fallback via Caddy |
 | Caddy | 8080 | local origin, tunnel target |
 
 ## Operations
@@ -140,6 +140,10 @@ token and stream id, forwards MediaMTX session and blocking-reload query
 parameters, and only then fetches media. Peer requests use the same signed URLs
 and SHA-256 hashes.
 
+The `/webrtc/live/<id>/whep` route is a read-only fallback for when the LL-HLS
+muxer cannot continue. It is not token-gated, but Caddy restricts it to WHEP
+playback; WHIP publishing still goes through the API and its host-key check.
+
 ## Verified end-to-end
 
 The following was exercised against the production build, Caddy and a public
@@ -152,6 +156,8 @@ Cloudflare Quick Tunnel:
   `maxDepth 2`
 - peer-assisted transfer observed (`21% via peers` in the tunnel run); origin
   fallback continued to work
+- forced HLS edge failure: the viewer automatically switched to the WHEP
+  fallback and kept playing 720×1280 without an error overlay
 - host auth rejection (`401`), bad playback token rejection (`403`), chat
   broadcast and persistence, media health probe
 
@@ -163,8 +169,11 @@ timing, so a small fresh swarm may still be mostly origin-served.
 
 - **Viewer says "Tuning into the live edge"** — check that the stream is live,
   MediaMTX is running (`npm run media`), and `/api/media/health` is reachable.
-- **Publish fails** — MediaMTX must be running. The API proxies WHIP; port 8889
-  is intentionally not exposed publicly.
+- **Viewer loses the edge / `too many reordered frames`** — a lossy publisher
+  link can break MediaMTX's LL-HLS muxer. The player falls back to direct WHEP
+  playback; for a cleaner stream, use a more stable publisher network.
+- **Publish fails** — MediaMTX must be running. The API proxies WHIP; Caddy
+  only exposes the read-only WHEP fallback, not the WHIP publish endpoint.
 - **No camera prompt** — use `http://localhost` or the HTTPS tunnel URL. Plain
   HTTP on a LAN IP is not a secure origin.
 - **Tunnel URL stopped working** — Quick Tunnel URLs rotate. Restart

@@ -71,11 +71,107 @@ export function Player({
     let swarm: SwarmClient | null = null;
     let statsTimer: ReturnType<typeof setInterval> | null = null;
     let recoveries = 0;
+    let whep: RTCPeerConnection | null = null;
+    let fallbackStarted = false;
     const history: number[] = [];
 
     setState("loading");
     setError(null);
     setNeedsGesture(false);
+
+    const waitForIceGathering = (pc: RTCPeerConnection) =>
+      new Promise<void>((resolve) => {
+        if (pc.iceGatheringState === "complete") {
+          resolve();
+          return;
+        }
+        const finish = () => {
+          pc.removeEventListener("icegatheringstatechange", onChange);
+          resolve();
+        };
+        const onChange = () => {
+          if (pc.iceGatheringState === "complete") finish();
+        };
+        pc.addEventListener("icegatheringstatechange", onChange);
+        window.setTimeout(finish, 3000);
+      });
+
+    // LL-HLS is the normal path, but a lossy publisher link can make
+    // MediaMTX's HLS muxer reject reordered H.264 frames. If that happens,
+    // switch the viewer to a direct WHEP connection instead of dropping the
+    // live edge entirely.
+    const startWhepFallback = async () => {
+      if (disposed || fallbackStarted) return;
+      fallbackStarted = true;
+      setError(null);
+      setState("loading");
+      setUsingPeers(false);
+      hls?.destroy();
+      hlsRef.current = null;
+      swarm?.destroy();
+      swarm = null;
+      swarmRef.current = null;
+
+      const video = videoRef.current;
+      if (!video) return;
+
+      try {
+        const pc = new RTCPeerConnection({
+          iceServers: [
+            { urls: "stun:stun.l.google.com:19302" },
+            { urls: "stun:stun.cloudflare.com:3478" },
+          ],
+        });
+        whep = pc;
+
+        const remote = new MediaStream();
+        pc.ontrack = (event) => {
+          if (event.streams[0]) {
+            video.srcObject = event.streams[0];
+          } else {
+            remote.addTrack(event.track);
+            video.srcObject = remote;
+          }
+          setState("ready");
+          void video
+            .play()
+            .then(() => setPlaying(true))
+            .catch(() => setNeedsGesture(true));
+        };
+
+        pc.onconnectionstatechange = () => {
+          if (pc.connectionState === "failed") {
+            setError("The direct WebRTC fallback could not connect.");
+            setState("error");
+          }
+        };
+
+        pc.addTransceiver("video", { direction: "recvonly" });
+        pc.addTransceiver("audio", { direction: "recvonly" });
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        await waitForIceGathering(pc);
+
+        const response = await fetch(`/webrtc/live/${streamId}/whep`, {
+          method: "POST",
+          headers: { "content-type": "application/sdp" },
+          body: pc.localDescription?.sdp ?? offer.sdp,
+          cache: "no-store",
+        });
+        if (!response.ok) {
+          throw new Error(`direct media fallback failed (${response.status})`);
+        }
+        const answer = await response.text();
+        await pc.setRemoteDescription({ type: "answer", sdp: answer });
+        setState("ready");
+      } catch (caught) {
+        if (disposed) return;
+        const message =
+          caught instanceof Error ? caught.message : "The live edge is not reachable.";
+        setError(message);
+        setState("error");
+      }
+    };
 
     const boot = async () => {
       if (!guest) return;
@@ -143,24 +239,25 @@ export function Player({
           });
 
           hls.on(Hls.Events.ERROR, (_event, data) => {
-            if (!data.fatal || disposed) return;
+            if (!data.fatal || disposed || fallbackStarted) return;
             if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
               recoveries += 1;
               if (recoveries <= 2) {
                 hls?.startLoad();
                 return;
               }
-              setError("The live edge is not reachable. The room may have just ended.");
+              void startWhepFallback();
+              return;
             } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
               recoveries += 1;
               if (recoveries <= 2) {
                 hls?.recoverMediaError();
                 return;
               }
-              setError("Playback hit a media error. Try reloading the player.");
-            } else {
-              setError("This browser could not start the stream.");
+              void startWhepFallback();
+              return;
             }
+            setError("This browser could not start the stream.");
             setState("error");
           });
 
@@ -241,10 +338,13 @@ export function Player({
       if (statsTimer) clearInterval(statsTimer);
       hls?.destroy();
       hlsRef.current = null;
+      whep?.close();
+      whep = null;
       swarm?.destroy();
       swarmRef.current = null;
       const video = videoRef.current;
       if (video) {
+        video.srcObject = null;
         video.removeAttribute("src");
         video.load();
       }

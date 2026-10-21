@@ -34,6 +34,15 @@
 		}
 	}
 
+	# WHEP-only WebRTC fallback for viewers when the LL-HLS muxer cannot keep
+	# up with a lossy publisher link. Restrict this to the read endpoint so the
+	# public route cannot be used to publish to MediaMTX.
+	@webrtc_whep path_regexp ^/webrtc/live/[^/]+/whep$
+	handle @webrtc_whep {
+		uri strip_prefix /webrtc
+		reverse_proxy 127.0.0.1:8889
+	}
+
 	handle {
 		reverse_proxy 127.0.0.1:3000 {
 			header_up X-Real-IP {remote_host}
