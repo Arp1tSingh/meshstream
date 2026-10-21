@@ -1,0 +1,36 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# builds
+.next/
+out/
+dist/
+build/
+*.tsbuildinfo
+
+# local env
+.env
+.env.local
+.env.*.local
+
+# runtime data
+data/*
+!data/.gitkeep
+services/bin/
+.tools/
+
+# logs
+*.log
+npm-debug.log*
+
+# editors / os
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# test artifacts
+test-results/
+playwright-report/
+.vercel/
