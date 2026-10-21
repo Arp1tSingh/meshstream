@@ -40,6 +40,14 @@ webrtcLocalTCPAddress: ""
 webrtcIPsFromInterfaces: true
 webrtcIPsFromInterfacesList: []
 webrtcAdditionalHosts: [127.0.0.1]
+# The home connection is behind CGNAT, so MediaMTX cannot rely on a static
+# public IP or port forwarding. STUN lets it advertise the public mapping that
+# the carrier NAT opens; the browser (which already uses Google STUN) can then
+# attempt WebRTC hole punching from any network.
+webrtcICEServers2:
+  - url: stun:stun.l.google.com:19302
+  - url: stun:stun.cloudflare.com:3478
+webrtcSTUNGatherTimeout: 5s
 webrtcHandshakeTimeout: 10s
 webrtcTrackGatherTimeout: 2s
 

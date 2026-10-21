@@ -55,8 +55,10 @@ is required. For a stable hostname, use a named tunnel with a domain you own.
 
 Use the public URL for the studio so camera access gets a secure origin. The
 host publishing path still uses MediaMTX's WebRTC listener on the local machine.
-Viewers anywhere can watch over the tunnel; a host on a different network needs
-UDP `8189` reachable (or a TURN/ingest relay), which v1 does not set up.
+Remote hosts publish over WebRTC; MediaMTX uses STUN to discover the home
+connection's public mapping, so CGNAT without port forwarding works when the
+home firewall allows inbound UDP `8189`. Networks that block UDP still need a
+TURN/ingest relay.
 
 ## Production-style single origin
 
