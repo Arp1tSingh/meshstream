@@ -69,7 +69,8 @@ COOKIE_SECRET=$(New-Secret)
 PLAYBACK_SECRET=$(New-Secret)
 INTERNAL_SECRET=$(New-Secret)
 "@
-  Set-Content -Path (Join-Path $root ".env") -Value $envBody -Encoding utf8
+  $envPath = Join-Path $root ".env"
+  [System.IO.File]::WriteAllText($envPath, $envBody, (New-Object System.Text.UTF8Encoding($false)))
 }
 
 if (-not $SkipBuild) {

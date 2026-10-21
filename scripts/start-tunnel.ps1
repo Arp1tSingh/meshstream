@@ -61,7 +61,7 @@ try {
     if (-not $foundUrl -and $line -match "https://[a-z0-9-]+\.trycloudflare\.com") {
       $foundUrl = $true
       $publicUrl = $Matches[0]
-      Set-Content -Path $urlFile -Value $publicUrl -NoNewline -Encoding utf8
+      [System.IO.File]::WriteAllText($urlFile, $publicUrl, (New-Object System.Text.UTF8Encoding($false)))
       Write-Host ""
       Write-Host "Public URL: $publicUrl" -ForegroundColor Green
       Write-Host "Open the studio through this URL so camera permissions get a secure origin." -ForegroundColor Green
