@@ -1,0 +1,60 @@
+###############################################
+# MeshStream local media origin
+# MediaMTX accepts WHIP from the studio proxy and emits LL-HLS.
+# Run from the repository root: npm run media
+###############################################
+
+logLevel: info
+logDestinations: [stdout]
+
+# Only the API and the local studio need these listeners.
+api: false
+metrics: false
+pprof: false
+playback: false
+
+# Keep the surface small: no RTSP, RTMP, SRT or MoQ.
+rtsp: false
+rtmp: false
+srt: false
+moq: false
+
+hls: true
+hlsAddress: 127.0.0.1:8888
+hlsAllowOrigins: ["*"]
+hlsVariant: lowLatency
+hlsSegmentCount: 7
+hlsSegmentDuration: 1s
+hlsPartDuration: 400ms
+hlsSegmentMaxSize: 50M
+hlsMuxerCloseAfter: 60s
+# Parts live in memory; recordings go to DATA_DIR via the API.
+hlsAlwaysRemux: false
+hlsDirectory: ""
+
+webrtc: true
+webrtcAddress: 127.0.0.1:8889
+webrtcAllowOrigins: ["*"]
+webrtcLocalUDPAddress: :8189
+webrtcLocalTCPAddress: ""
+webrtcIPsFromInterfaces: true
+webrtcIPsFromInterfacesList: []
+webrtcAdditionalHosts: [127.0.0.1]
+webrtcHandshakeTimeout: 10s
+webrtcTrackGatherTimeout: 2s
+
+pathDefaults:
+  source: publisher
+  overridePublisher: true
+  record: false
+  recordFormat: fmp4
+  recordPartDuration: 1s
+  recordSegmentDuration: 1h
+  recordDeleteAfter: 168h
+
+paths:
+  all_others:
+    source: publisher
+    record: true
+    # Relative to the working directory (the repo root when started by scripts).
+    recordPath: ./data/recordings/%path/%Y-%m-%d_%H-%M-%S-%f
