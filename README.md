@@ -102,7 +102,7 @@ Live streaming has strict real-time playback deadlines. The custom hls.js loader
 
 ## 📂 Monorepo Structure
 
-Plaintext
+```text
 meshstream/
 ├── apps/
 │   ├── web/                    # Frontend Client (Stream Player, Broadcaster UI, Swarm Telemetry)
@@ -120,6 +120,7 @@ meshstream/
 ├── mediamtx.yml                # MediaMTX configuration for WHIP ingest, LL-HLS muxing & webhook triggers
 ├── package.json                # Workspace root scripts & dependency definitions
 └── tsconfig.base.json          # Shared TypeScript compiler configuration
+```
 
 ## 📡 Signaling & Wire Protocol (@meshstream/protocol)
 
@@ -155,29 +156,32 @@ All control communication between clients and apps/signal is strictly typed via 
 
 ### 1. Clone & Install Dependencies
 
-Bash
+```bash
 git clone https://github.com/Arp1tSingh/meshstream.git
 cd meshstream
 npm install
+```
 
 ### 2. Build Shared Packages
 
 Build @meshstream/protocol and @meshstream/swarm so the apps can consume their compiled artifacts:
 
-Bash
+```bash
 npm run build --workspaces --if-present
+```
 
 ### 3. Start the Infrastructure & Services
 
 Launch the MediaMTX server, Caddy reverse proxy, backend services (apps/signal, apps/api), and frontend (apps/web). If using the included orchestration scripts on Windows/PowerShell:
 
-PowerShell
+```powershell
 # Start all services (MediaMTX, Caddy, API, Signal Tracker, and Web UI)
 .\start.ps1
+```
 
 (Alternatively, run each workspace service in separate terminals):
 
-Bash
+```bash
 # Terminal 1: Media Server
 mediamtx mediamtx.yml
 
@@ -192,6 +196,7 @@ npm --workspace=apps/web run dev
 
 # Terminal 5: Reverse Proxy
 caddy run --config Caddyfile
+```
 
 ## 🧪 Testing the P2P Swarm Locally
 
