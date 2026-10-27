@@ -1,198 +1,233 @@
-# MeshStream
+<div align="center">
 
-Peer-assisted 720p live streaming from a browser, with a dark studio UI and a
-free public edge. No accounts, no email, no paid infrastructure.
+# 🌐 MeshStream
+**A Hybrid Peer-to-Peer (P2P) Live Video Streaming Platform Built on WebRTC DataChannels & Low-Latency HLS**
 
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6?style=for-the-badge&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![WebRTC](https://img.shields.io/badge/WebRTC-DataChannels%20%26%20WHIP-333333?style=for-the-badge&logo=webrtc&logoColor=white)](https://webrtc.org/)
+[![HLS.js](https://img.shields.io/badge/HLS-Low--Latency-FF6600?style=for-the-badge)](https://github.com/video-dev/hls.js/)
+[![MediaMTX](https://img.shields.io/badge/MediaMTX-Ingest%20%26%20Transmux-00ADD8?style=for-the-badge)](https://github.com/bluenviron/mediamtx)
+[![Caddy](https://img.shields.io/badge/Caddy-Reverse%20Proxy-1F88C0?style=for-the-badge&logo=caddy&logoColor=white)](https://caddyserver.com/)
+
+*Offloading origin server bandwidth by transforming concurrent live-stream viewers into a self-organizing mesh distribution network.*
+
+[Architecture](#-system-architecture) • [Networking Mechanics](#-core-networking-mechanics) • [Monorepo Structure](#-monorepo-structure) • [Getting Started](#-getting-started) • [Protocol Spec](#-signaling--wire-protocol)
+
+</div>
+
+---
+
+## 📖 Overview
+
+Traditional live video streaming relies on a centralized Client-Server (CDN) topology where $N$ concurrent viewers require $O(N)$ egress bandwidth from the origin media server. During traffic spikes, origin servers become a critical bottleneck and incur massive bandwidth costs.
+
+**MeshStream** solves this at the application and transport layers by implementing a **Hybrid CDN + Peer-to-Peer (P2P) Mesh Architecture**:
+1. **Ultra-Low Latency Ingestion:** Broadcasters publish live streams via **WHIP** (WebRTC-HTTP Ingestion Protocol) directly from the browser or OBS into **MediaMTX**.
+2. **Real-Time Transmuxing:** MediaMTX transmuxes the incoming WebRTC RTP media tracks into **Low-Latency HLS (LL-HLS)** segments (`.ts` / `.m4s` and `.m3u8` manifests) without transcoding overhead.
+3. **Swarm-Assisted Delivery:** Viewers join a stream room coordinated by a WebSocket signaling tracker (`apps/signal`) and establish **WebRTC DataChannels** (`SCTP` over `DTLS/UDP`) with neighboring peers via `@meshstream/swarm`.
+4. **Custom HLS Loader Interceptor:** A custom `hls.js` segment loader (`hlsLoader.ts`) intercepts video segment requests, querying the P2P mesh swarm first and seamlessly falling back to the HTTP origin server if peer delivery exceeds the playback deadline.
+
+---
+
+## 🏗️ System Architecture
+
+```mermaid
+graph TB
+    subgraph Broadcaster ["🎥 Broadcaster Layer"]
+        B[Browser / OBS Studio]
+    end
+
+    subgraph Edge ["🛡️ Reverse Proxy & Origin Infrastructure"]
+        C[Caddy Reverse Proxy<br/>TLS Termination & Routing]
+        M[MediaMTX Media Server<br/>WHIP Ingest → LL-HLS Origin]
+        API[apps/api<br/>Lifecycle Webhooks & Stream State]
+        SIG[apps/signal<br/>WebSocket Tracker & ICE Broker]
+    end
+
+    subgraph Swarm ["🕸️ Viewer P2P Mesh Swarm (apps/web + @meshstream/swarm)"]
+        P1((Peer A<br/>Seeder/Leecher))
+        P2((Peer B<br/>Seeder/Leecher))
+        P3((Peer C<br/>Seeder/Leecher))
+    end
+
+    B ==>|WHIP: WebRTC Media Ingest| C
+    C ==>|Proxy WHIP| M
+    M -.->|Stream Ready / Closed Hooks| API
+
+    C <==>|WSS: Signaling & Bitfield Announcements| SIG
+    SIG <==>|SDP Offer/Answer & ICE Candidates| P1
+    SIG <==>|SDP Offer/Answer & ICE Candidates| P2
+    SIG <==>|SDP Offer/Answer & ICE Candidates| P3
+
+    M ==>|HTTP Fallback: Fetch .m3u8 & Initial Segments| C
+    C ==>|HTTPS Origin Fetch| P1
+    C -.->|Fallback on P2P Timeout| P2
+    C -.->|Fallback on P2P Timeout| P3
+
+    P1 <==>|WebRTC DataChannel<br/>Chunked Binary Segments| P2
+    P2 <==>|WebRTC DataChannel<br/>Chunked Binary Segments| P3
+    P1 <==>|WebRTC DataChannel<br/>Chunked Binary Segments| P3
 ```
-Creator browser ──WHIP──▶ MediaMTX ──LL-HLS──▶ API edge proxy ──▶ viewers
-                                                     ▲               │
-                                                     └── WebRTC ◀────┘
-```
 
-Viewers form a WebRTC tree. Each peer keeps a small verified cache of HLS parts
-and can serve its children before falling back to the origin. The origin proxy
-meters egress, signs playback URLs, and stores SHA-256 hashes so a corrupted
-peer segment is rejected.
+## 🧠 Core Networking Mechanics
 
-## What is in v1
+MeshStream demonstrates key Computer Networks principles across the Transport, Session, and Application layers:
 
-- **720p H.264 + Opus**, Low-Latency HLS with ~400 ms parts and 1 s segments
-- **Guest-only identity** — a signed `ms_guest` cookie, no password or email
-- **Browser studio** — camera/screen capture, mic meter, WHIP publish, track
-  replacement, local recording, room health, chat, command palette
-- **Peer-assisted playback** — custom hls.js fragment loader, verified peer
-  cache, origin fallback, peer/edge telemetry
-- **Animated explainer** at `/how-it-works` with an interactive swarm simulator
-- **Single free origin** — Caddy on `:8080`, Cloudflare Quick Tunnel for HTTPS
-- **No transcoder** — MediaMTX remuxes the browser's H.264 directly into LL-HLS
+1. **WHIP Ingestion & Real-Time Transmuxing**
+Instead of high-latency RTMP over TCP (which suffers from head-of-line blocking), broadcasters ingest media using WHIP (RFC 9725) over UDP. MediaMTX receives the RTP packets and repackages the H.264/Opus payloads into fragmented MP4 / MPEG-TS segments for HLS delivery.
 
-## Quick start (development)
+2. **WebSocket Tracker & Mesh Topology Formation (apps/signal)**
+When a viewer opens a stream, the client connects to the WebSocket signaling server and joins a logical swarm room tied to the streamId:
 
-Prerequisites: Node.js 24+, a camera/microphone, and PowerShell on Windows.
+- **Peer Discovery:** The tracker returns a bounded subset of active peer IDs in the room to prevent full-mesh connection explosion, maintaining an optimal peer degree ($k$-regular mesh).
+- **NAT Traversal:** Peers exchange SDP Offers/Answers and trickle ICE Candidates (STUN/TURN) through the tracker to punch holes through NATs and firewalls.
+- **Segment Availability (Bitfield/Have Maps):** As peers download segments (either from the HTTP origin or other peers), they broadcast HAVE announcements over the mesh so neighbors maintain a local map of which peers hold which segment URIs.
 
-```powershell
+3. **Chunked Binary Transfer over WebRTC DataChannels (@meshstream/swarm)**
+WebRTC DataChannels run on SCTP (Stream Control Transmission Protocol) tunneled over DTLS/UDP. Because SCTP enforces a maximum message size limit (typically 16 KB – 64 KB across browser implementations) while video segments range from 500 KB to 4 MB:
+
+- **Fragmentation & Reassembly:** @meshstream/swarm slices outgoing ArrayBuffer video segments into fixed-size binary chunks (e.g., 16 KB) tagged with a header containing the segment ID, chunk index, and total chunk count.
+- **Backpressure Control:** Uses `RTCDataChannel.bufferedAmount` and `bufferedamountlow` events to prevent SCTP send-buffer overflow during high-bitrate transfers.
+- **In-Memory LRU Cache:** Each peer caches recently decoded segments in a bounded LRU ring buffer to serve incoming peer requests without exhausting browser memory.
+
+4. **Hybrid Segment Scheduling & HTTP Fallback (hlsLoader.ts)**
+Live streaming has strict real-time playback deadlines. The custom hls.js loader implements a deterministic race/fallback policy:
+
+- **m3u8 Playlists:** Always fetched directly from the HTTP Origin via Caddy to guarantee fresh sliding-window manifest state.
+- **Media Segments (.ts / .m4s):**
+  1. **Swarm Lookup:** Query @meshstream/swarm for connected peers advertising the requested segment URI.
+  2. **P2P Fetch with Deadline:** Issue a `SEGMENT_REQ` over the lowest-RTT DataChannel and start a strict timeout timer (tuned to buffer health).
+  3. **Origin Fallback:** If no peer holds the segment, the peer disconnects mid-transfer, or the P2P transfer exceeds the timeout threshold, `hlsLoader.ts` immediately aborts the P2P request and fetches the segment via standard `fetch()` from the MediaMTX HTTP origin.
+- **Telemetry Tracking:** Every resolved byte is categorized as `p2pBytes` or `httpBytes`, dynamically computing the live P2P Offload Ratio (%) and active mesh topology on the client dashboard.
+
+## 📂 Monorepo Structure
+
+Plaintext
+meshstream/
+├── apps/
+│   ├── web/                    # Frontend Client (Stream Player, Broadcaster UI, Swarm Telemetry)
+│   │   └── src/
+│   │       ├── hlsLoader.ts    # Custom hls.js loader intercepting segment requests for P2P/HTTP
+│   │       └── ...             # UI components, real-time offload graphs & player bindings
+│   ├── signal/                 # WebSocket Signaling Server & Swarm Tracker
+│   │   └── src/                # Room registry, peer matchmaking, SDP/ICE relay broker
+│   └── api/                    # Backend Control Plane & MediaMTX Webhook Receiver
+│       └── src/                # Stream lifecycle hooks (onPublish, onUnpublish) & stream metadata
+├── packages/
+│   ├── protocol/               # (@meshstream/protocol) Shared TypeScript signaling schemas & wire types
+│   └── swarm/                  # (@meshstream/swarm) WebRTC PeerConnection pool, DataChannel chunking & LRU cache
+├── Caddyfile                   # Reverse proxy routing (/whip, /hls, /ws, /api) & local TLS termination
+├── mediamtx.yml                # MediaMTX configuration for WHIP ingest, LL-HLS muxing & webhook triggers
+├── package.json                # Workspace root scripts & dependency definitions
+└── tsconfig.base.json          # Shared TypeScript compiler configuration
+
+## 📡 Signaling & Wire Protocol (@meshstream/protocol)
+
+All control communication between clients and apps/signal is strictly typed via @meshstream/protocol.
+
+### Signaling Messages (WebSocket JSON)
+
+| Message Type | Direction | Description |
+|--------------|-----------|-------------|
+| JOIN_ROOM | Client → Tracker | Registers peer in a streamId swarm room and requests an initial peer list. |
+| PEER_LIST | Tracker → Client | Returns active peer IDs currently participating in the stream swarm. |
+| PEER_JOINED / PEER_LEFT | Tracker → Client | Notifies connected peers of swarm churn to rebalance mesh connections. |
+| SIGNAL_OFFER | Peer → Tracker → Peer | Relays WebRTC `RTCSessionDescriptionInit` (SDP Offer) to target peer. |
+| SIGNAL_ANSWER | Peer → Tracker → Peer | Relays WebRTC `RTCSessionDescriptionInit` (SDP Answer) to initiating peer. |
+| SIGNAL_ICE | Peer → Tracker → Peer | Relays trickle `RTCIceCandidateInit` payloads for NAT traversal. |
+
+### DataChannel Wire Messages (Peer-to-Peer)
+
+| Message Type | Payload Format | Description |
+|--------------|---------------|-------------|
+| HAVE | JSON Control | Broadcasts newly cached segment URI (segmentId) to connected neighbors. |
+| SEGMENT_REQ | JSON Control | Requests a specific segmentId from a neighbor advertising availability. |
+| SEGMENT_CHUNK | Binary (ArrayBuffer) | Header + 16 KB slice of the requested media segment. |
+| SEGMENT_NOT_FOUND | JSON Control | Immediate NACK if the segment was evicted from the peer's LRU cache, triggering immediate HTTP fallback. |
+
+## 🚀 Getting Started
+
+### Prerequisites
+
+- Node.js (v18+ recommended)
+- MediaMTX binary installed or placed in the project root/PATH
+- Caddy installed for unified reverse-proxy routing and HTTPS/WSS local termination
+
+### 1. Clone & Install Dependencies
+
+Bash
+git clone https://github.com/Arp1tSingh/meshstream.git
+cd meshstream
 npm install
-npm run media:setup     # downloads MediaMTX, Caddy, cloudflared into .tools/
-npm run media           # terminal 1: MediaMTX on :8888/:8889
-npm run dev             # terminal 2: web :3000, API :4000, signal :4001
-```
 
-Open http://localhost:3000, choose **Go live**, allow the camera, and copy the
-viewer link. Open the viewer link in two more tabs/windows to form a peer edge.
+### 2. Build Shared Packages
 
-The app is usable without MediaMTX for browsing, the explainer, the simulator,
-settings and guest sessions. Live playback needs the media process.
+Build @meshstream/protocol and @meshstream/swarm so the apps can consume their compiled artifacts:
 
-## Free public URL
+Bash
+npm run build --workspaces --if-present
 
-```powershell
-npm run tunnel          # writes data/tunnel-url.txt while it runs
-```
+### 3. Start the Infrastructure & Services
 
-This is a Cloudflare Quick Tunnel pointed at Caddy. The URL is public, gets
-HTTPS/WSS, and **rotates every time the tunnel restarts**. No Cloudflare account
-is required. For a stable hostname, use a named tunnel with a domain you own.
+Launch the MediaMTX server, Caddy reverse proxy, backend services (apps/signal, apps/api), and frontend (apps/web). If using the included orchestration scripts on Windows/PowerShell:
 
-Use the public URL for the studio so camera access gets a secure origin. The
-host publishing path still uses MediaMTX's WebRTC listener on the local machine.
-Remote hosts publish over WebRTC; MediaMTX uses STUN to discover the home
-connection's public mapping, so CGNAT without port forwarding works when the
-home firewall allows inbound UDP `8189`. Networks that block UDP still need a
-TURN/ingest relay.
+PowerShell
+# Start all services (MediaMTX, Caddy, API, Signal Tracker, and Web UI)
+.\start.ps1
 
-## Production-style single origin
+(Alternatively, run each workspace service in separate terminals):
 
-```powershell
-npm run build
-npm run up              # builds, starts missing services, opens the tunnel
-```
+Bash
+# Terminal 1: Media Server
+mediamtx mediamtx.yml
 
-`npm run up`:
-1. installs the media toolchain if `.tools/` is empty
-2. creates `.env` with random secrets if it is missing
-3. builds the web app
-4. starts MediaMTX, the app stack and Caddy in separate PowerShell windows
-5. waits for `http://localhost:8080/api/health`
-6. runs the Quick Tunnel in the foreground
+# Terminal 2: Signaling Tracker
+npm --workspace=apps/signal run dev
 
-`npm run up -- -SkipBuild` reuses the existing production build. Stop the
-tunnel with `Ctrl+C`; the other service windows remain open. Restart services
-with the same commands or the optional logon tasks below.
+# Terminal 3: API & Webhook Server
+npm --workspace=apps/api run dev
 
-| Service | Local port | Public route |
-|---|---|---|
-| Web (Next.js) | 3000 | `/` (through Caddy) |
-| API (Fastify + SQLite) | 4000 | `/api/*`, `/hls/*` |
-| Signal (`ws`) | 4001 | `/ws/*` |
-| MediaMTX LL-HLS | 8888 (localhost) | proxied by API, never exposed |
-| MediaMTX WHIP/WHEP | 8889 (localhost) | WHIP proxied by API; read-only `/webrtc/live/<id>/whep` fallback via Caddy |
-| Caddy | 8080 | local origin, tunnel target |
+# Terminal 4: Web Frontend
+npm --workspace=apps/web run dev
 
-## Operations
+# Terminal 5: Reverse Proxy
+caddy run --config Caddyfile
 
-| Command | What it does |
-|---|---|
-| `npm run dev` | Next, API and signal in watch mode |
-| `npm run build` | production web build |
-| `npm run typecheck` | TypeScript for API, signal and web |
-| `npm run media:setup` | download/update MediaMTX, Caddy, cloudflared |
-| `npm run media` / `media:start` | start MediaMTX with `services/mediamtx/mediamtx.yml` |
-| `npm run caddy` | start Caddy with `services/caddy/Caddyfile` |
-| `npm run tunnel` | start a Quick Tunnel to `http://localhost:8080` |
-| `npm run up` | production-style stack + tunnel |
-| `npm run services:install` | optional scheduled tasks at Windows logon |
-| `npm run services:install -- -Remove` | remove those logon tasks |
+## 🧪 Testing the P2P Swarm Locally
 
-`services:install` is optional and runs from the current checkout. The tunnel
-task is opt-in (`-IncludeTunnel`) because its URL rotates on restart.
+### Start Broadcasting
 
-## Environment
+Open the broadcaster view in your browser (or configure OBS Studio with Service: WHIP pointing to the Caddy/MediaMTX WHIP ingest endpoint, e.g., `https://localhost/whip/<stream-key>`).
 
-No `.env` is required for development. The API falls back to localhost origins
-and development secrets. For a shared or public instance, create `.env` (or let
-`npm run up` create it) and set:
+Start streaming video. apps/api will register the stream via MediaMTX's runOnReady hook.
 
-```ini
-COOKIE_SECRET=<32+ random bytes>
-PLAYBACK_SECRET=<random secret>
-INTERNAL_SECRET=<random secret>
-```
+### Spawn the Viewer Swarm
 
-Optional overrides are documented in [.env.example](./.env.example). Keep
-`NEXT_PUBLIC_API_URL` and `NEXT_PUBLIC_SIGNAL_URL` **unset** for the normal
-same-origin deployment; the browser automatically uses localhost ports in dev
-and the current origin behind Caddy. Setting public URLs into a build makes it
-hard to move between localhost and the tunnel.
+Open Tab 1 (Peer A) at the viewer URL. Since Peer A is the first viewer in the room, 100% of its segments will be fetched via HTTP Origin. Peer A immediately caches these segments in @meshstream/swarm.
 
-Runtime data lives in `data/` (SQLite, recordings, tunnel URL/log) and is
-gitignored. `.tools/` is also gitignored.
+Open Tab 2 (Peer B) and Tab 3 (Peer C) to the same stream URL.
 
-## How host control works
+### Observe Bandwidth Offloading
 
-Creating a room returns a random host key. Only a SHA-256 hash is stored by the
-API, and the key is saved in the host browser's local storage. Host actions
-(start, stop, WHIP proxy, stats, internal chat persistence) require the
-`x-host-key` header. The key is never sent to MediaMTX. There is intentionally
-no account system in v1.
+Watch the real-time network telemetry dashboard on Peer B and Peer C.
 
-Playback URLs carry short-lived HMAC tokens. The `/hls/*` proxy validates the
-token and stream id, forwards MediaMTX session and blocking-reload query
-parameters, and only then fetches media. Peer requests use the same signed URLs
-and SHA-256 hashes.
+After the initial WebRTC DataChannel handshake completes via apps/signal, `hlsLoader.ts` will begin pulling video segments directly from Peer A's memory cache over RTCDataChannel.
 
-The `/webrtc/live/<id>/whep` route is a read-only fallback for when the LL-HLS
-muxer cannot continue. It is not token-gated, but Caddy restricts it to WHEP
-playback; WHIP publishing still goes through the API and its host-key check.
+Verify in DevTools (chrome://webrtc-internals or the Network tab) that `.ts` / `.m4s` segment transfers drop off the HTTP network waterfall and flow across the WebRTC DataChannel.
 
-## Verified end-to-end
+## 📊 Key Computer Networks Concepts Demonstrated
 
-The following was exercised against the production build, Caddy and a public
-Cloudflare Quick Tunnel:
+- **Application-Layer Multicast (ALM):** Constructing an overlay network on top of unicast links so viewers relay live video payloads without router-level IP Multicast support.
+- **Transport Layer Trade-offs (TCP vs. UDP/SCTP):** Combining TCP/TLS for reliable manifest and signaling delivery with UDP-based WebRTC (RTP for ingest, SCTP/DTLS for DataChannels) to eliminate TCP head-of-line blocking across peer links.
+- **NAT Traversal & ICE (RFC 8445):** Interactive Connectivity Establishment using STUN/TURN candidate gathering and SDP negotiation.
+- **Hybrid Edge-P2P Scheduling:** Balancing P2P offload efficiency against strict real-time playback QoS constraints through deadline-aware HTTP fallback.
 
-- studio unlock, fake-camera capture, **Go live**, WHIP publish, **On air**
-- MediaMTX H.264 track at **1280×720**, LL-HLS master and variant playlists,
-  400 ms parts, 200 responses for parts
-- three viewer tabs all playing; signal tree reported `3 peers`, `1 edge`,
-  `maxDepth 2`
-- peer-assisted transfer observed (`21% via peers` in the tunnel run); origin
-  fallback continued to work
-- forced HLS edge failure: the viewer automatically switched to the WHEP
-  fallback and kept playing 720×1280 without an error overlay
-- host auth rejection (`401`), bad playback token rejection (`403`), chat
-  broadcast and persistence, media health probe
+## 👤 Author
 
-Headless browser tests can show inflated stalls in background tabs; foreground
-viewer tabs play normally. Peer offload depends on buffered overlap and network
-timing, so a small fresh swarm may still be mostly origin-served.
+Arpit Singh
 
-## Troubleshooting
+GitHub: @Arp1tSingh
 
-- **Viewer says "Tuning into the live edge"** — check that the stream is live,
-  MediaMTX is running (`npm run media`), and `/api/media/health` is reachable.
-- **Viewer loses the edge / `too many reordered frames`** — a lossy publisher
-  link can break MediaMTX's LL-HLS muxer. The player falls back to direct WHEP
-  playback; for a cleaner stream, use a more stable publisher network.
-- **Publish fails** — MediaMTX must be running. The API proxies WHIP; Caddy
-  only exposes the read-only WHEP fallback, not the WHIP publish endpoint.
-- **No camera prompt** — use `http://localhost` or the HTTPS tunnel URL. Plain
-  HTTP on a LAN IP is not a secure origin.
-- **Tunnel URL stopped working** — Quick Tunnel URLs rotate. Restart
-  `npm run tunnel` and use the new `data/tunnel-url.txt`.
-- **Windows closes the services** — keep the PowerShell windows open, disable
-  sleep, or install the optional logon tasks.
+## 📄 License
 
-## Layout
-
-```
-apps/web             Next.js studio, viewer, explainer, settings
-apps/api             Fastify API, SQLite (node:sqlite), HLS proxy, WHIP proxy
-apps/signal          WebSocket tree coordinator + chat
-packages/protocol    shared domain and wire types
-packages/swarm       browser P2P engine
-services/            MediaMTX and Caddy configs
-scripts/             PowerShell setup/run/tunnel/task scripts
-plan.md              full architecture and design notes
-```
-
-Built with Next.js 15, Fastify, `ws`, MediaMTX, Caddy, hls.js and WebRTC data
-channels. v1 is intentionally one rendition, one origin, and no TURN.
+This project is licensed under the MIT License.
