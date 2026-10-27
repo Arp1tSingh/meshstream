@@ -12,12 +12,22 @@ import {
   type StreamRow,
 } from "./db";
 import { env } from "./env";
-import { ensureGuest, rateLimit, refreshGuestCookie } from "./guest";
 import {
+  chargeRate,
+  ensureGuest,
+  peekRate,
+  rateLimit,
+  refreshGuestCookie,
+} from "./guest";
+import {
+  ByteMeter,
   getHashes,
   getOriginMbps,
+  getTotalOriginMbps,
   mintPlaybackToken,
+  verifyPlaybackToken,
 } from "./hls";
+import { startMediaSessionPoller, type MediaSessionPoller } from "./mediamtx";
 
 const GUEST_COLORS = new Set([
   "#C9F73A",
@@ -47,6 +57,89 @@ interface SignalStats {
   edges: number;
   maxDepth: number;
 }
+
+// Phase 4: direct WebRTC (WHEP) playback sessions. MediaMTX's WebRTC read
+// endpoint is loopback-only, so the API is the only public entrypoint; every
+// session here is token-gated at creation, capped per stream and accounted
+// per session. The authoritative per-session byte count comes from the
+// MediaMTX control API on loopback; the viewer's getStats() report stays
+// advisory. Sessions that stop heartbeating expire below.
+interface WhepSession {
+  id: string;
+  streamId: string;
+  guestId: string;
+  createdAt: number;
+  lastSeen: number;
+  reportedMbps: number;
+  /** The WHEP session token MediaMTX answers with (DELETE credential). */
+  deleteToken: string;
+  /** MediaMTX control-API cumulative bytes sent to this viewer. */
+  meterBytes: number;
+  /** Rolling Mbps computed from real MediaMTX deltas; null before first poll. */
+  meter: ByteMeter;
+  /** Seen at least once by the control API poller. */
+  meterObserved: boolean;
+  meterAt: number;
+}
+
+const WHEP_SESSION_TTL_MS = 90 * 1000;
+/** WHEP creation rate budget: successful creations only see this window. */
+const WHEP_RATE_MAX = 6;
+const WHEP_RATE_WINDOW_MS = 60 * 1000;
+const whepSessions = new Map<string, WhepSession>();
+
+function countWhepSessions(streamId: string) {
+  const cutoff = Date.now() - WHEP_SESSION_TTL_MS;
+  for (const [id, session] of whepSessions) {
+    if (session.lastSeen < cutoff) whepSessions.delete(id);
+  }
+  let count = 0;
+  for (const session of whepSessions.values()) {
+    if (session.streamId === streamId) count += 1;
+  }
+  return count;
+}
+
+/**
+ * Real origin egress from all accounted WHEP sessions (control-API deltas).
+ * Unobserved sessions contribute their advisory report until the poller
+ * catches up so the budget guard is never blind to a live viewer.
+ */
+function totalWhepMbps() {
+  const cutoff = Date.now() - WHEP_SESSION_TTL_MS;
+  let total = 0;
+  for (const session of whepSessions.values()) {
+    if (session.lastSeen < cutoff) continue;
+    total += session.meterObserved && session.meterAt > 0 ? session.meter.mbps() : session.reportedMbps;
+  }
+  return total;
+}
+
+function whepMbpsForStream(streamId: string) {
+  const cutoff = Date.now() - WHEP_SESSION_TTL_MS;
+  let total = 0;
+  for (const session of whepSessions.values()) {
+    if (session.streamId !== streamId || session.lastSeen < cutoff) continue;
+    total += session.meterObserved && session.meterAt > 0 ? session.meter.mbps() : session.reportedMbps;
+  }
+  return total;
+}
+
+/**
+ * Control-API poller: folds whatever MediaMTX currently knows about every
+ * WebRTC reader session back into the local session table. MediaMTX session
+ * ids are the same string the route tables key sessions by.
+ */
+const mediaPoller: MediaSessionPoller = startMediaSessionPoller((sid, sent) => {
+  const session = whepSessions.get(sid);
+  if (!session) return;
+  if (session.meterObserved && sent >= session.meterBytes) {
+    session.meter.add(sent - session.meterBytes);
+  }
+  session.meterBytes = sent;
+  session.meterObserved = true;
+  session.meterAt = Date.now();
+});
 
 async function fetchSignalStats(streamId: string): Promise<SignalStats> {
   try {
@@ -110,12 +203,16 @@ function computeHealth(
   originMbps: number,
   budget: number,
   stats: SignalStats,
+  directMbps = 0,
 ) {
   if (state !== "live") return "F" as const;
+  // The origin uplink is shared by the HLS proxy and the direct WebRTC
+  // sessions, so both count against the budget.
+  const usedMbps = originMbps + directMbps;
   let score = 100;
-  if (originMbps > budget) score -= 40;
-  else if (originMbps > budget * 0.85) score -= 22;
-  else if (originMbps > budget * 0.65) score -= 8;
+  if (usedMbps > budget) score -= 40;
+  else if (usedMbps > budget * 0.85) score -= 22;
+  else if (usedMbps > budget * 0.65) score -= 8;
   if (stats.viewers > 2 && stats.peers === 0) score -= 10;
   if (score >= 90) return "A" as const;
   if (score >= 75) return "B" as const;
@@ -269,6 +366,7 @@ export async function registerRoutes(app: FastifyInstance) {
     return {
       streamId: id,
       hlsPath: `/hls/live/${id}/index.m3u8${query}`,
+      whepPath: `/api/streams/${id}/whep${query}`,
       token,
       p2p: true,
       state: stream.state,
@@ -289,15 +387,35 @@ export async function registerRoutes(app: FastifyInstance) {
     if (!stream) return undefined;
     const stats = await fetchSignalStats(id);
     const originMbps = getOriginMbps(id);
+    const whepEntries = [...whepSessions.values()].filter(
+      (session) => session.streamId === id && session.lastSeen >= Date.now() - WHEP_SESSION_TTL_MS,
+    );
+    // Real byte counts from the MediaMTX control API win; the client-reported
+    // values only stand in when the control API is unreachable. Either way
+    // the number feeding the budget guard is digits-first, not trust-first.
+    const metered = mediaPoller.reachable;
+    const whepMbps = metered
+      ? whepEntries.reduce(
+          (total, session) =>
+            total +
+            (session.meterObserved && session.meterAt > 0 ? session.meter.mbps() : 0),
+          0,
+        )
+      : whepEntries.reduce((total, session) => total + session.reportedMbps, 0);
+    const advisoryMbps = whepEntries.reduce((total, session) => total + session.reportedMbps, 0);
     return {
       viewers: stats.viewers,
       peers: stats.peers,
       edges: stats.edges,
       originMbps,
       originBudgetMbps: env.originBudgetMbps,
-      health: computeHealth(stream.state, originMbps, env.originBudgetMbps, stats),
+      health: computeHealth(stream.state, originMbps, env.originBudgetMbps, stats, whepMbps),
       state: stream.state,
       uptimeSeconds: stream.started_at ? Math.max(0, (Date.now() - stream.started_at) / 1000) : 0,
+      whepSessions: whepEntries.length,
+      whepMbps: Number(whepMbps.toFixed(2)),
+      whepMbpsAdvisory: Number(advisoryMbps.toFixed(2)),
+      whepMeterSource: metered ? "mediamtx-api" : "client-advisory",
     };
   });
 
@@ -417,5 +535,187 @@ export async function registerRoutes(app: FastifyInstance) {
       .code(upstream.status)
       .header("content-type", "application/sdp")
       .send(answer);
+  });
+
+  // Phase 4: direct WebRTC fallback playback, proxied to MediaMTX exactly
+  // like the WHIP publish path. The playback handshake output (/playback)
+  // carries a signed, stream-bound token that every session must present.
+  // Gate order: 404 -> 409 state -> 403 token -> 429 rate (peek) -> 429 cap
+  // -> 429 budget -> 400 SDP -> upstream. Only a successful creation charges
+  // the rate window (peekRate instead of a blind charge), so rejected
+  // attempts never consume the viewer's budget.
+  app.post("/api/streams/:id/whep", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const stream = getStream(id);
+    if (!stream) return reply.code(404).send({ error: "stream not found" });
+    if (stream.state !== "live") {
+      return reply.code(409).send({ error: "stream is not live", state: stream.state });
+    }
+    const token = typeof request.query === "object" && request.query !== null
+      ? String((request.query as Record<string, unknown>).t ?? "")
+      : "";
+    if (env.requirePlaybackToken) {
+      const tokenStream = token ? verifyPlaybackToken(token) : null;
+      if (!tokenStream || tokenStream !== id) {
+        return reply.code(403).send({ error: "invalid or missing playback token" });
+      }
+    }
+    const rateKey = `whep:${request.ip}`;
+    if (peekRate(rateKey) >= WHEP_RATE_MAX) {
+      return reply.code(429).send({ error: "too many direct-media attempts" });
+    }
+    const guest = ensureGuest(request, reply);
+    if (countWhepSessions(id) >= env.whepMaxSessions) {
+      return reply.code(429).send({
+        error: "direct WebRTC viewer cap reached for this stream",
+        sessions: countWhepSessions(id),
+      });
+    }
+    // Direct WebRTC egress draws from the same origin uplink as the HLS
+    // proxy, so a creation only fits when the projected headline traffic
+    // still fits the budget.
+    const usedMbps = Number((getTotalOriginMbps() + totalWhepMbps()).toFixed(2));
+    if (usedMbps + env.whepPerSessionMbps > env.originBudgetMbps) {
+      return reply.code(429).send({
+        error: "origin budget exhausted for direct playback",
+        usedMbps,
+        budgetMbps: env.originBudgetMbps,
+      });
+    }
+    const sdp = typeof request.body === "string" ? request.body : "";
+    if (!sdp.includes("v=0")) {
+      return reply.code(400).send({ error: "invalid SDP offer" });
+    }
+    // The API mints its own accounting key up front and hands it to MediaMTX
+    // as the `msid` query token: MediaMTX echoes the create request's query
+    // onto the control-API session record (`session.query`), which is the one
+    // deterministic way to bind the internal reader session to this row.
+    const sessionId = randomBytes(16).toString("base64url");
+    let upstream: Response;
+    try {
+      upstream = await fetch(
+        `${env.mediaWhipOrigin}/live/${id}/whep?msid=${encodeURIComponent(sessionId)}`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/sdp" },
+          body: sdp,
+          signal: AbortSignal.timeout(12_000),
+        },
+      );
+    } catch {
+      return reply.code(502).send({
+        error: "media server unavailable",
+        hint: "Start MediaMTX with npm run media",
+      });
+    }
+    const answer = await upstream.text();
+    if (!upstream.ok) {
+      return reply.code(upstream.status).send({
+        error: "media server rejected the direct playback",
+        detail: answer.slice(0, 500),
+      });
+    }
+    // Successful creation: this is the only point that consumes the rate
+    // window. If a concurrent burst filled it meanwhile, tear the upstream
+    // session back down instead of leaking it.
+    if (!chargeRate(rateKey, WHEP_RATE_MAX, WHEP_RATE_WINDOW_MS)) {
+      const location = upstream.headers.get("location") ?? "";
+      const orphan = location
+        .split("/")
+        .filter(Boolean)
+        .pop()
+        ?.split("?")[0];
+      if (orphan) {
+        await fetch(`${env.mediaWhipOrigin}/live/${id}/whep/${orphan}`, {
+          method: "DELETE",
+          signal: AbortSignal.timeout(5000),
+        }).catch(() => undefined);
+      }
+      return reply.code(429).send({ error: "too many direct-media attempts" });
+    }
+    // The MediaMTX answer's WHEP Location token is what teardown needs; the
+    // accounting row and every subsequent report/delete reference the msid
+    // the route minted, which the control API also echoes back.
+    const location = upstream.headers.get("location") ?? "";
+    const deleteToken =
+      location
+        .split("/")
+        .filter(Boolean)
+        .pop()
+        ?.split("?")[0] || sessionId;
+    whepSessions.set(sessionId, {
+      id: sessionId,
+      streamId: id,
+      guestId: guest.id,
+      deleteToken,
+      createdAt: Date.now(),
+      lastSeen: Date.now(),
+      reportedMbps: 0,
+      meterBytes: 0,
+      meter: new ByteMeter(),
+      meterObserved: false,
+      meterAt: 0,
+    });
+    return reply
+      .code(upstream.status)
+      .header("content-type", "application/sdp")
+      .header("x-whep-session-id", sessionId)
+      .send(answer);
+  });
+
+  // Session accounting heartbeat: the viewer reads its inbound RTP byte
+  // count from pc.getStats() and reports the delta every 10 s. These are
+  // advisory numbers only — the origin budget is fed by the MediaMTX control
+  // API — but reporting still keeps the session alive and gives a fallback
+  // data point when the control API is unreachable.
+  app.post("/api/streams/:id/whep/report", async (request, reply) => {
+    if (!rateLimit(`whep-report:${request.ip}`, 15, 60 * 1000)) {
+      return reply.code(429).send({ error: "too many reports" });
+    }
+    const { id } = request.params as { id: string };
+    const body = (request.body ?? {}) as { sessionId?: unknown; mbps?: unknown };
+    const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
+    const session = sessionId ? whepSessions.get(sessionId) : undefined;
+    if (!session || session.streamId !== id) {
+      return reply.code(404).send({ error: "unknown direct-media session" });
+    }
+    const raw = Number(body.mbps);
+    if (!Number.isFinite(raw) || raw < 0) {
+      return reply.code(400).send({ error: "invalid bitrate sample" });
+    }
+    session.reportedMbps = Math.min(50, Math.round(raw * 100) / 100);
+    session.lastSeen = Date.now();
+    return {
+      ok: true,
+      sessions: countWhepSessions(id),
+      meterSource: mediaPoller.reachable ? "mediamtx-api" : "client-advisory",
+    };
+  });
+
+  // Session teardown: the session id itself is the capability here (it comes
+  // from MediaMTX and is not guessable). Clear local accounting, then ask
+  // MediaMTX to drop the session too.
+  app.delete("/api/streams/:id/whep", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const sessionId = typeof request.query === "object" && request.query !== null
+      ? String((request.query as Record<string, unknown>).sid ?? "")
+      : "";
+    const session = sessionId ? whepSessions.get(sessionId) : undefined;
+    if (!session || session.streamId !== id) {
+      return reply.code(404).send({ error: "unknown direct-media session" });
+    }
+    whepSessions.delete(sessionId);
+    try {
+      // The control-API reader answers to its own WHEP Location token, not
+      // the msid key that indexes the local table.
+      await fetch(`${env.mediaWhipOrigin}/live/${id}/whep/${session.deleteToken}`, {
+        method: "DELETE",
+        signal: AbortSignal.timeout(5000),
+      });
+    } catch {
+      // MediaMTX also closes reader sessions when the ICE connection dies;
+      // local accounting is already released, so this is best effort.
+    }
+    return { ok: true, sessions: countWhepSessions(id) };
   });
 }

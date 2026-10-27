@@ -5,7 +5,7 @@ import { env, PLAYBACK_TTL_SECONDS } from "./env";
 const meters = new Map<string, ByteMeter>();
 const hashes = new Map<string, Map<string, string>>();
 
-class ByteMeter {
+export class ByteMeter {
   private samples: Array<{ t: number; n: number }> = [];
 
   add(bytes: number) {
@@ -35,6 +35,13 @@ export function getMeter(streamId: string) {
 
 export function getOriginMbps(streamId: string) {
   return Number(getMeter(streamId).mbps().toFixed(2));
+}
+
+/** Every stream's HLS egress combined — the proxy uplink budget is shared. */
+export function getTotalOriginMbps() {
+  let total = 0;
+  for (const meter of meters.values()) total += meter.mbps();
+  return Number(total.toFixed(2));
 }
 
 export function rememberHash(streamId: string, pathname: string, buffer: Buffer) {

@@ -7,8 +7,11 @@
 logLevel: info
 logDestinations: [stdout]
 
-# Only the API and the local studio need these listeners.
-api: false
+# Only the API and the local studio need these listeners. The control API is
+# enabled so the API can read real per-session WebRTC byte counters
+# (client-reported Mbps stays advisory) — loopback only, never exposed.
+api: true
+apiAddress: 127.0.0.1:9997
 metrics: false
 pprof: false
 playback: false

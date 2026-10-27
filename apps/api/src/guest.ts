@@ -124,14 +124,40 @@ export function safeCompare(a: string, b: string) {
   return ha.length === hb.length && timingSafeEqual(ha, hb);
 }
 
-const buckets = new Map<string, { count: number; reset: number }>();
+interface RateBucket {
+  count: number;
+  reset: number;
+}
 
-export function rateLimit(key: string, max: number, windowMs: number): boolean {
+const buckets = new Map<string, RateBucket>();
+
+/**
+ * Units already charged against `key` inside the current fixed window.
+ * Lets a request reserve nothing up front and be rejected cheaply while only
+ * successful work charges the budget later (see chargeRate).
+ */
+export function peekRate(key: string): number {
   const now = Date.now();
   const bucket = buckets.get(key);
-  if (!bucket || bucket.reset < now) {
-    buckets.set(key, { count: 1, reset: now + windowMs });
-    return true;
+  if (!bucket) return 0;
+  if (bucket.reset <= now) {
+    buckets.delete(key);
+    return 0;
+  }
+  return bucket.count;
+}
+
+/**
+ * Charge one unit against a fixed window; false once the window would exceed
+ * `max`. The reset time is not extended by later charges — the window keeps
+ * its original expiry.
+ */
+export function chargeRate(key: string, max: number, windowMs: number): boolean {
+  const now = Date.now();
+  let bucket = buckets.get(key);
+  if (!bucket || bucket.reset <= now) {
+    bucket = { count: 0, reset: now + windowMs };
+    buckets.set(key, bucket);
   }
   if (bucket.count >= max) return false;
   bucket.count += 1;
@@ -139,4 +165,8 @@ export function rateLimit(key: string, max: number, windowMs: number): boolean {
     for (const [k, v] of buckets) if (v.reset < now) buckets.delete(k);
   }
   return true;
+}
+
+export function rateLimit(key: string, max: number, windowMs: number): boolean {
+  return chargeRate(key, max, windowMs);
 }

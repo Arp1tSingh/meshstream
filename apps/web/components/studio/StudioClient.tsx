@@ -31,6 +31,7 @@ import type { ReactNode } from "react";import {
   X,
 } from "lucide-react";
 import type { StreamStats, StreamSummary } from "@meshstream/protocol";
+import type { VideoOutboundSample } from "@/lib/outboundSample";
 import { Avatar, Badge, Button, Input, Kbd, buttonClass } from "@/components/ui";
 import { ChatPanel } from "@/components/chat/ChatPanel";
 import { useGuest } from "@/components/providers/GuestProvider";
@@ -39,6 +40,7 @@ import { useMediaCapture } from "@/lib/useMediaCapture";
 import { useChat } from "@/lib/useChat";
 import { api, ApiError, getApiBase } from "@/lib/api";
 import { publishToWhip } from "@/lib/whip";
+import { debugLogSample, isStatsDebugEnabled } from "@/lib/debugStats";
 import { getHost, saveHost } from "@/lib/hostKey";
 import { formatDuration, shortId } from "@/lib/format";
 import { cn } from "@/lib/cn";
@@ -54,9 +56,16 @@ interface WhipMetrics {
   fps: number | null;
   rtt: number | null;
   history: number[];
+  outbound: VideoOutboundSample | null;
 }
 
-const emptyWhip: WhipMetrics = { bitrate: null, fps: null, rtt: null, history: [] };
+const emptyWhip: WhipMetrics = {
+  bitrate: null,
+  fps: null,
+  rtt: null,
+  history: [],
+  outbound: null,
+};
 
 export function StudioClient({ streamId }: { streamId: string }) {
   const router = useRouter();
@@ -90,6 +99,7 @@ export function StudioClient({ streamId }: { streamId: string }) {
   const recorderRef = useRef<MediaRecorder | null>(null);
   const recordChunksRef = useRef<Blob[]>([]);
   const recordMimeRef = useRef("video/webm");
+  const statsDebug = useMemo(() => isStatsDebugEnabled(), []);
 
   const live = stream?.state === "live";
 
@@ -242,6 +252,7 @@ export function StudioClient({ streamId }: { streamId: string }) {
     let disposed = false;
     let lastBytes = 0;
     let lastAt = 0;
+    const encodeStart = performance.now();
     let timer: ReturnType<typeof setInterval> | null = null;
 
     const sample = async () => {
@@ -250,19 +261,55 @@ export function StudioClient({ streamId }: { streamId: string }) {
       try {
         const report = await pc.getStats();
         let bytes = 0;
+        let bytesSent: number | null = null;
         let fps: number | null = null;
         let rtt: number | null = null;
+        let targetBitrate: number | null = null;
+        let frameWidth: number | null = null;
+        let frameHeight: number | null = null;
+        let encoderImplementation: string | null = null;
+        let nackCount: number | null = null;
+        let pliCount: number | null = null;
+        let retransmittedPacketsSent: number | null = null;
+        let qualityLimitationReason: string | null = null;
+        let qualityLimitationDurations: Record<string, number> | null = null;
+        let availableOutgoingBitrate: number | null = null;
+
         report.forEach((entry) => {
+          const st = entry as unknown as Record<string, unknown>;
           if (entry.type === "outbound-rtp" && entry.kind === "video") {
-            if (typeof entry.bytesSent === "number") bytes += entry.bytesSent;
+            if (typeof entry.bytesSent === "number") {
+              bytes += entry.bytesSent;
+              bytesSent = entry.bytesSent;
+            }
             if (typeof entry.framesPerSecond === "number") fps = entry.framesPerSecond;
+            if (typeof st.targetBitrate === "number") targetBitrate = st.targetBitrate;
+            if (typeof st.frameWidth === "number") frameWidth = st.frameWidth;
+            if (typeof st.frameHeight === "number") frameHeight = st.frameHeight;
+            if (typeof st.encoderImplementation === "string")
+              encoderImplementation = st.encoderImplementation;
+            if (typeof st.nackCount === "number") nackCount = st.nackCount;
+            if (typeof st.pliCount === "number") pliCount = st.pliCount;
+            if (typeof st.retransmittedPacketsSent === "number")
+              retransmittedPacketsSent = st.retransmittedPacketsSent;
+            if (typeof st.qualityLimitationReason === "string")
+              qualityLimitationReason = st.qualityLimitationReason;
+            const durations = st.qualityLimitationDurations;
+            if (typeof durations === "object" && durations !== null) {
+              const rounded: Record<string, number> = {};
+              for (const [key, value] of Object.entries(durations)) {
+                if (typeof value === "number") rounded[key] = Math.round(value * 100) / 100;
+              }
+              qualityLimitationDurations = rounded;
+            }
           }
-          if (
-            entry.type === "candidate-pair" &&
-            entry.state === "succeeded" &&
-            typeof entry.currentRoundTripTime === "number"
-          ) {
-            if (rtt === null || entry.nominated) rtt = entry.currentRoundTripTime;
+          if (entry.type === "candidate-pair") {
+            if (typeof st.availableOutgoingBitrate === "number") {
+              availableOutgoingBitrate = Math.max(availableOutgoingBitrate ?? 0, st.availableOutgoingBitrate);
+            }
+            if (entry.state === "succeeded" && typeof entry.currentRoundTripTime === "number") {
+              if (rtt === null || entry.nominated) rtt = entry.currentRoundTripTime;
+            }
           }
         });
         if (disposed) return;
@@ -276,14 +323,46 @@ export function StudioClient({ streamId }: { streamId: string }) {
           lastBytes = bytes;
           lastAt = now;
         }
+        const outbound: VideoOutboundSample = {
+          bitrateMbps: bitrate === null ? null : Math.round(bitrate * 100) / 100,
+          fps: fps === null ? null : Math.round(fps * 10) / 10,
+          targetBitrateMbps: targetBitrate === null ? null : Math.round(targetBitrate / 1000) / 1000,
+          frameWidth,
+          frameHeight,
+          encoderImplementation,
+          nackCount,
+          pliCount,
+          retransmittedPacketsSent,
+          qualityLimitationReason,
+          qualityLimitationDurations,
+          availableOutgoingBitrateMbps:
+            availableOutgoingBitrate === null
+              ? null
+              : Math.round(availableOutgoingBitrate / 1000) / 1000,
+          rttSeconds: rtt,
+        };
+        debugLogSample("encode", {
+          t: Math.round((now - encodeStart) / 100) / 10,
+          outMbps: outbound.bitrateMbps,
+          fps: outbound.fps,
+          targetMbps: outbound.targetBitrateMbps,
+          res: frameWidth === null ? null : `${frameWidth}x${frameHeight}`,
+          enc: encoderImplementation,
+          nack: nackCount,
+          pli: pliCount,
+          retrans: retransmittedPacketsSent,
+          limiter: qualityLimitationReason,
+          limiterS: qualityLimitationDurations,
+          outgoingBwMbps: outbound.availableOutgoingBitrateMbps,
+          rtt: rtt === null ? null : Math.round(rtt * 1000) / 1000,
+          bytesSent,
+        });
         setWhip((current) => ({
           bitrate,
           fps,
           rtt,
-          history:
-            bitrate !== null
-              ? [...current.history, bitrate].slice(-32)
-              : current.history,
+          history: bitrate !== null ? [...current.history, bitrate].slice(-32) : current.history,
+          outbound,
         }));
       } catch {
         // getStats can briefly fail while the connection settles.
@@ -375,6 +454,7 @@ export function StudioClient({ streamId }: { streamId: string }) {
   const goLive = useCallback(async () => {
     if (!capture.stream) {
       setPublishError("Enable the camera or share a screen before going live.");
+      debugLogSample("publish", { phase: "early-return", reason: "no-capture" });
       return;
     }
     setGoingLive(true);
@@ -418,7 +498,7 @@ export function StudioClient({ streamId }: { streamId: string }) {
         });
       }
 
-      await publishToWhip({ pc, streamId, hostKey });
+      await publishToWhip({ pc, streamId, hostKey, source: capture.screen ? "screen" : "camera" });
       publishingRef.current = true;
       setPublishing(true);
       setStats((current) => (current ? { ...current, state: "live" } : current));
@@ -435,11 +515,16 @@ export function StudioClient({ streamId }: { streamId: string }) {
       setPublishing(false);
       setConnection("idle");
       setStream((current) => (current ? { ...current, state: "idle" } : current));
-      setPublishError(
+      const message =
         cause instanceof Error
           ? cause.message
-          : "Could not go live. Check the media server and retry.",
-      );
+          : "Could not go live. Check the media server and retry.";
+      debugLogSample("publish", {
+        phase: "error",
+        message,
+        cause: cause instanceof DOMException ? cause.name : undefined,
+      });
+      setPublishError(message);
       await api(`/api/streams/${streamId}/stop`, {
         method: "POST",
         headers: { "x-host-key": hostKey },
@@ -485,6 +570,47 @@ export function StudioClient({ streamId }: { streamId: string }) {
   const openViewer = useCallback(() => {
     if (viewerUrl) window.open(viewerUrl, "_blank", "noopener,noreferrer");
   }, [viewerUrl]);
+
+  // Latest-ref so scripted runs never invoke a goLive whose captured closure
+  // still predates the camera/screen stream arriving.
+  const goLiveRef = useRef(goLive);
+  useEffect(() => {
+    goLiveRef.current = goLive;
+  }, [goLive]);
+
+  // Phase-0 scripted baseline runs only. Reached with ?debug=stats&sim=cam|screen:
+  // re-causes capture to start, then publishes through the normal goLive path.
+  // Without the debug flag nothing happens.
+  const simParam = useMemo(() => {
+    if (!statsDebug) return "";
+    return new URLSearchParams(window.location.search).get("sim") ?? "";
+  }, [statsDebug]);
+  const simArmedRef = useRef(false);
+  useEffect(() => {
+    if (!simParam || gate !== "ready") return;
+    if (simParam !== "cam" && simParam !== "screen") return;
+    if (publishing || publishingRef.current || goingLive) return;
+    if (simArmedRef.current) return;
+    if (capture.starting) return;
+    // Armed-once: re-renders while capture runs must NOT cancel the publish.
+    simArmedRef.current = true;
+    void (async () => {
+      if (!capture.stream) {
+        const started =
+          simParam === "screen" ? await capture.startScreen() : await capture.start();
+        if (!started) {
+          debugLogSample("sim", { source: simParam, phase: "capture-failed" });
+          return;
+        }
+      }
+      debugLogSample("sim", { source: simParam, phase: "publishing" });
+      setTimeout(() => {
+        if (!publishingRef.current) void goLiveRef.current();
+      }, 250);
+    })().catch(() => {
+      simArmedRef.current = false;
+    });
+  }, [simParam, gate, capture, publishing, goingLive]);
 
   const actions = useMemo<CommandAction[]>(
     () => [
@@ -538,10 +664,14 @@ export function StudioClient({ streamId }: { streamId: string }) {
       {
         id: "record",
         label: recording ? "Stop local recording" : "Start local recording",
-        hint: recording ? "Download the WebM when it stops" : "Saved in this browser, not on the server",
+        hint: publishing
+          ? "Disabled while broadcasting — the server keeps this stream's recordings"
+          : recording
+            ? "Download the WebM when it stops"
+            : "Saved in this browser, not on the server",
         icon: <Disc className="h-3.5 w-3.5" />,
         run: recording ? stopRecording : startRecording,
-        disabled: !capture.stream && !recording,
+        disabled: publishing || (!capture.stream && !recording),
       },
       {
         id: "copy",
@@ -577,6 +707,7 @@ export function StudioClient({ streamId }: { streamId: string }) {
     [
       live,
       goingLive,
+      publishing,
       capture,
       endStream,
       goLive,
@@ -850,9 +981,20 @@ export function StudioClient({ streamId }: { streamId: string }) {
                 active={recording}
                 icon={<Disc className="h-3.5 w-3.5" />}
                 label={recording ? `Stop · ${formatDuration(recordSeconds)}` : "Record locally"}
-                sub="webm · this device"
+                sub={
+                  publishing
+                    ? "not while live · server recordings"
+                    : recording
+                      ? "stopping downloads the webm"
+                      : "webm · this device"
+                }
+                title={
+                  publishing
+                    ? "Local recording is disabled while broadcasting — the server keeps this stream's recordings."
+                    : undefined
+                }
                 onClick={recording ? stopRecording : startRecording}
-                disabled={!capture.stream && !recording}
+                disabled={publishing || (!capture.stream && !recording)}
                 tone={recording ? "live" : "default"}
               />
               <SidebarButton
@@ -1033,6 +1175,8 @@ export function StudioClient({ streamId }: { streamId: string }) {
             bitrate={whip.bitrate}
             history={whip.history}
             publishing={publishing}
+            outbound={whip.outbound}
+            debug={statsDebug}
           />
 
           <ChatPanel
@@ -1081,6 +1225,7 @@ function SidebarButton({
   active,
   tone = "default",
   disabled,
+  title,
   onClick,
 }: {
   icon: ReactNode;
@@ -1089,6 +1234,7 @@ function SidebarButton({
   active?: boolean;
   tone?: "default" | "live";
   disabled?: boolean;
+  title?: string;
   onClick: () => void;
 }) {
   return (
@@ -1096,6 +1242,7 @@ function SidebarButton({
       type="button"
       onClick={onClick}
       disabled={disabled}
+      title={title}
       className={cn(
         "flex w-full items-center gap-2.5 rounded-md border px-2.5 py-2 text-left transition disabled:cursor-not-allowed disabled:opacity-40",
         active

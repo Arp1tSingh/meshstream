@@ -9,6 +9,7 @@ import {
   Users,
 } from "lucide-react";
 import type { StreamStats, StreamSummary } from "@meshstream/protocol";
+import type { VideoOutboundSample } from "@/lib/outboundSample";
 import { Sparkline } from "@/components/ui";
 import { formatDuration, formatMbps } from "@/lib/format";
 import { cn } from "@/lib/cn";
@@ -27,12 +28,16 @@ export function HealthPanel({
   bitrate,
   history,
   publishing,
+  outbound,
+  debug = false,
 }: {
   stats: StreamStats | null;
   stream: StreamSummary | null;
   bitrate: number | null;
   history: number[];
   publishing: boolean;
+  outbound: VideoOutboundSample | null;
+  debug?: boolean;
 }) {
   const live = stats?.state === "live";
   const grade = live ? (stats?.health ?? null) : null;
@@ -155,6 +160,50 @@ export function HealthPanel({
           <span>{Math.round(ratio * 100)}% used</span>
         </div>
       </div>
+
+      {debug && outbound ? (
+        <div className="border-t border-line px-4 py-3">
+          <div className="mono-label">Encoder diagnostics · debug</div>
+          <div className="mt-2 grid grid-cols-[84px_1fr] gap-y-0.5 font-mono text-[9px] text-faint">
+            <span>target</span>
+            <span className="text-muted">
+              {outbound.targetBitrateMbps === null ? "—" : `${outbound.targetBitrateMbps} Mbps`}
+            </span>
+            <span>resolution</span>
+            <span className="text-muted">
+              {outbound.frameWidth === null ? "—" : `${outbound.frameWidth}×${outbound.frameHeight}`}
+            </span>
+            <span>fps</span>
+            <span className="text-muted">{outbound.fps ?? "—"}</span>
+            <span>encoder</span>
+            <span className="text-muted">{outbound.encoderImplementation ?? "—"}</span>
+            <span>limit reason</span>
+            <span className="text-muted">{outbound.qualityLimitationReason ?? "—"}</span>
+            <span>limit s</span>
+            <span className="truncate text-muted">
+              {outbound.qualityLimitationDurations
+                ? JSON.stringify(outbound.qualityLimitationDurations)
+                : "—"}
+            </span>
+            <span>nack / pli</span>
+            <span className="text-muted">
+              {outbound.nackCount ?? "—"} / {outbound.pliCount ?? "—"}
+            </span>
+            <span>retrans</span>
+            <span className="text-muted">{outbound.retransmittedPacketsSent ?? "—"}</span>
+            <span>outgoing bw</span>
+            <span className="text-muted">
+              {outbound.availableOutgoingBitrateMbps === null
+                ? "—"
+                : `${outbound.availableOutgoingBitrateMbps} Mbps`}
+            </span>
+            <span>rtt</span>
+            <span className="text-muted">
+              {outbound.rttSeconds === null ? "—" : `${Math.round(outbound.rttSeconds * 1000)} ms`}
+            </span>
+          </div>
+        </div>
+      ) : null}
 
       <div className="flex items-center justify-between gap-2 border-t border-line px-4 py-2.5">
         <span className="inline-flex items-center gap-1.5 font-mono text-[8.5px] uppercase tracking-[0.1em] text-faint">

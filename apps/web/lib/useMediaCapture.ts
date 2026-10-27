@@ -151,6 +151,9 @@ export function useMediaCapture() {
         setMicOn(true);
         setScreen(false);
         const cameraTrack = next.getVideoTracks()[0];
+        // Motion-aligned metadata helps the encoder spend bits on moving
+        // content (people) instead of static background.
+        if (cameraTrack) cameraTrack.contentHint = "motion";
         setActiveCameraId(cameraTrack?.getSettings().deviceId ?? cameraId ?? "");
         attachMeter(next);
         await refreshDevices();
@@ -196,6 +199,8 @@ export function useMediaCapture() {
       setScreen(true);
       setCameraOn(true);
       const videoTrack = display.getVideoTracks()[0];
+      // Screen content is text/edges first; hint the encoder accordingly.
+      if (videoTrack) videoTrack.contentHint = "detail";
       videoTrack?.addEventListener(
         "ended",
         () => {

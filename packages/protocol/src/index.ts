@@ -23,6 +23,7 @@ export interface StreamSummary {
 export interface PlaybackInfo {
   streamId: string;
   hlsPath: string;
+  whepPath: string;
   token: string;
   p2p: boolean;
   state: StreamState;

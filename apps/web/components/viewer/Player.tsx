@@ -20,6 +20,7 @@ import type { SwarmPeerInfo } from "@meshstream/swarm";
 import { SwarmClient } from "@meshstream/swarm";
 import { createMeshFragmentLoader } from "@/lib/hlsLoader";
 import { api, getApiBase, getSignalBase, resolveApiPath } from "@/lib/api";
+import { debugLogSample, logSdpVideoSection } from "@/lib/debugStats";
 import { cn } from "@/lib/cn";
 
 export interface PlaybackMetrics {
@@ -30,6 +31,12 @@ export interface PlaybackMetrics {
 }
 
 type PlayerState = "loading" | "ready" | "offline" | "error" | "unsupported";
+
+// Stuck-attach watchdog deadlines (ms) — how long the player tolerates no
+// fragment loading after the manifest parsed, and no playback progress (with
+// fragments also gone quiet) while the viewer is meant to be playing.
+const WATCHDOG_ATTACH_MS = 12_000;
+const WATCHDOG_STALL_MS = 16_000;
 
 export function Player({
   streamId,
@@ -71,9 +78,28 @@ export function Player({
     let swarm: SwarmClient | null = null;
     let statsTimer: ReturnType<typeof setInterval> | null = null;
     let recoveries = 0;
+    let manifestParsed = false;
+    // Stuck-attach watchdog state: the phase 4 background-tab drill showed a
+    // silent failure mode — the manifest parses, playlists keep reloading,
+    // but no fragment is ever fetched and playback never starts, with no
+    // fatal hls.js error to trigger the normal recovery path. If either
+    // activity signal goes quiet for too long we retry the source once and
+    // then hand over to the WHEP fallback.
+    let firstFragAt = 0;
+    let lastActivityAt = performance.now();
+    let lastProgressTime = 0;
+    let watchdogRetried = false;
     let whep: RTCPeerConnection | null = null;
+    let whepSessionId = "";
+    let whepReportTimer: ReturnType<typeof setInterval> | null = null;
+    let playbackWhepPath = "";
     let fallbackStarted = false;
     const history: number[] = [];
+
+    // Phase-0 delivery stats, only used for instrumentation.
+    let bytesReceived = 0;
+    let bytesAtLastSample = 0;
+    const statsStart = performance.now();
 
     setState("loading");
     setError(null);
@@ -115,6 +141,47 @@ export function Player({
       const video = videoRef.current;
       if (!video) return;
 
+      // Per-session bitrate accounting: the RTP bytes flow peer<->MediaMTX
+      // directly, so the viewer reads its own inbound byte counter from
+      // pc.getStats() and reports the delta to the API every 10 s. This is
+      // also the session heartbeat the API uses to reap dead sessions.
+      const startWhepAccounting = (peer: RTCPeerConnection) => {
+        let lastBytes = 0;
+        let lastAt = 0;
+        const report = async () => {
+          if (disposed || !whepSessionId) return;
+          try {
+            const stats = await peer.getStats();
+            let bytes = 0;
+            stats.forEach((entry) => {
+              if (entry.type === "inbound-rtp" && typeof entry.bytesReceived === "number") {
+                bytes += entry.bytesReceived;
+              }
+            });
+            const now = Date.now();
+            if (lastAt > 0 && bytes > lastBytes) {
+              const mbps =
+                ((bytes - lastBytes) * 8) / ((now - lastAt) / 1000) / 1_000_000;
+              void fetch(resolveApiPath(`/api/streams/${streamId}/whep/report`), {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                  sessionId: whepSessionId,
+                  mbps: Math.round(mbps * 100) / 100,
+                }),
+                credentials: "include",
+              }).catch(() => undefined);
+            }
+            lastBytes = bytes;
+            lastAt = now;
+          } catch {
+            // keepalive errors are not fatal to playback
+          }
+        };
+        whepReportTimer = setInterval(() => void report(), 10_000);
+        void report();
+      };
+
       try {
         const pc = new RTCPeerConnection({
           iceServers: [
@@ -152,17 +219,28 @@ export function Player({
         await pc.setLocalDescription(offer);
         await waitForIceGathering(pc);
 
-        const response = await fetch(`/webrtc/live/${streamId}/whep`, {
-          method: "POST",
-          headers: { "content-type": "application/sdp" },
-          body: pc.localDescription?.sdp ?? offer.sdp,
-          cache: "no-store",
-        });
+        const response = await fetch(
+          playbackWhepPath || `/api/streams/${streamId}/whep`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/sdp" },
+            body: pc.localDescription?.sdp ?? offer.sdp,
+            cache: "no-store",
+            credentials: "include",
+          },
+        );
         if (!response.ok) {
           throw new Error(`direct media fallback failed (${response.status})`);
         }
         const answer = await response.text();
         await pc.setRemoteDescription({ type: "answer", sdp: answer });
+        logSdpVideoSection("viewer-whep-answer", answer);
+        whepSessionId = response.headers.get("x-whep-session-id") ?? "";
+        if (whepSessionId) {
+          startWhepAccounting(pc);
+        } else {
+          debugLogSample("player", { event: "whep-session-missing" });
+        }
         setState("ready");
       } catch (caught) {
         if (disposed) return;
@@ -178,6 +256,7 @@ export function Player({
       try {
         const playback = await api<PlaybackInfo>(`/api/streams/${streamId}/playback`);
         if (disposed) return;
+        playbackWhepPath = playback.whepPath ?? "";
         if (playback.state !== "live") {
           setState("offline");
           return;
@@ -216,11 +295,26 @@ export function Player({
         if (!video) return;
         const source = resolveApiPath(playback.hlsPath);
 
+        // Watchdog helper: a stall is either "manifest parsed but no
+        // fragment ever loaded" (silent attach stall, measured up to 60 s
+        // in background tabs) or "fragments stopped and the playhead is
+        // not moving while the player is supposed to be playing". Pausing
+        // the video is legitimate no-progress and must not escalate.
+        const watchdogStalled = () => {
+          const idleMs = performance.now() - lastActivityAt;
+          const attachStalled = !firstFragAt && idleMs > WATCHDOG_ATTACH_MS;
+          const playbackStalled = !video.paused && idleMs > WATCHDOG_STALL_MS;
+          return attachStalled || playbackStalled ? idleMs : 0;
+        };
+
         if (Hls.isSupported()) {
           const MeshFragmentLoader = createMeshFragmentLoader(swarm);
           hls = new Hls({
             lowLatencyMode: true,
-            liveSyncDurationCount: 2,
+            // One segment behind the edge (LL-HLS parts keep it smooth). With
+            // the playlist's reported target duration this lands ~2 s behind
+            // the publisher; the previous value of 2 measured at ~4.1 s.
+            liveSyncDurationCount: 1,
             liveMaxLatencyDurationCount: 8,
             maxLiveSyncPlaybackRate: 1.5,
             backBufferLength: 30,
@@ -229,8 +323,41 @@ export function Player({
           });
           hlsRef.current = hls;
 
+          // Watchdog helper: a stall is either "manifest parsed but no
+          // fragment ever loaded" (silent attach stall, measured up to 60 s
+          // in background tabs) or "fragments stopped and the playhead is
+          // not moving while the player is supposed to be playing". Both
+          // arms need the loopback deadlines below; pausing the video is
+          // legitimate no-progress and must not escalate.
+          const watchdogStalled = () => {
+            const idleMs = performance.now() - lastActivityAt;
+            const attachStalled = !firstFragAt && idleMs > WATCHDOG_ATTACH_MS;
+            const playing = !videoRef.current?.paused;
+            const playbackStalled = playing && idleMs > WATCHDOG_STALL_MS;
+            return attachStalled || playbackStalled ? idleMs : 0;
+          };
+
+          // hls.js hands every loaded payload through FRAG_LOADED — fragments
+          // and LL-HLS parts alike — so this covers swarm and origin paths.
+          hls.on(Hls.Events.FRAG_LOADED, (_event, data) => {
+            const total = Number(data?.payload?.byteLength ?? 0);
+            if (Number.isFinite(total) && total > 0) bytesReceived += total;
+            if (!firstFragAt) firstFragAt = performance.now();
+            lastActivityAt = performance.now();
+          });
+
+          hls.on(Hls.Events.MEDIA_ATTACHED, () => {
+            debugLogSample("hls", { event: "media-attached" });
+          });
+
           hls.on(Hls.Events.MANIFEST_PARSED, () => {
             if (disposed) return;
+            manifestParsed = true;
+            lastActivityAt = performance.now();
+            debugLogSample("hls", {
+              event: "manifest",
+              levels: hls?.levels?.length ?? 0,
+            });
             setState("ready");
             void video
               .play()
@@ -239,11 +366,28 @@ export function Player({
           });
 
           hls.on(Hls.Events.ERROR, (_event, data) => {
+            debugLogSample("hls", {
+              event: "error",
+              type: data.type,
+              details: data.details,
+              fatal: data.fatal,
+            });
             if (!data.fatal || disposed || fallbackStarted) return;
             if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
               recoveries += 1;
               if (recoveries <= 2) {
-                hls?.startLoad();
+                if (manifestParsed) {
+                  hls?.startLoad();
+                } else {
+                  // A fatal can land before the manifest ever parses, and
+                  // startLoad() cannot re-trigger a master manifest load
+                  // (only loadSource emits MANIFEST_LOADING in hls.js 1.7;
+                  // its own PlaylistLoader.startLoad is a no-op), so the
+                  // phase 4 drill showed the retry silently dropping and
+                  // the player hanging on the live-edge copy. Restart the
+                  // source path instead.
+                  hls?.loadSource(source);
+                }
                 return;
               }
               void startWhepFallback();
@@ -262,9 +406,12 @@ export function Player({
           });
 
           hls.attachMedia(video);
-          hls.on(Hls.Events.MEDIA_ATTACHED, () => {
-            hls?.loadSource(source);
-          });
+          // Load the manifest immediately instead of inside MEDIA_ATTACHED:
+          // the load does not require media attach (hls.js queues it), and a
+          // backgrounded tab can delay internal events — a phase 4 smoke run
+          // showed a viewer stuck on "Tuning into the live edge" for the
+          // whole session with the event-ordered call.
+          hls.loadSource(source);
         } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
           video.src = source;
           setState("ready");
@@ -278,6 +425,11 @@ export function Player({
           if (disposed) return;
           const element = videoRef.current;
           if (!element) return;
+
+          if (element.currentTime > lastProgressTime + 0.001) {
+            lastProgressTime = element.currentTime;
+            lastActivityAt = performance.now();
+          }
 
           const liveLatency =
             hls && Number.isFinite(hls.latency) && hls.latency > 0
@@ -296,9 +448,13 @@ export function Player({
           }
 
           const level = hls?.levels[hls.currentLevel];
+          const bwEstimate = hls ? Number(hls.bandwidthEstimate) : 0;
+          const bytesPerSecond = bytesReceived - bytesAtLastSample;
+          bytesAtLastSample = bytesReceived;
+          const measuredFallback = bwEstimate > 0 ? bwEstimate : bytesPerSecond * 8;
           const currentBitrate =
             level?.bitrate ??
-            (playback.state === "live" ? 2_500_000 : null);
+            (playback.state === "live" && measuredFallback > 0 ? measuredFallback : null);
 
           const mbps = currentBitrate ? currentBitrate / 1_000_000 : 0;
           history.push(mbps);
@@ -321,6 +477,61 @@ export function Player({
             // background tab. The swarm still falls back to origin on misses.
             swarm.setServing(buffered > 0.5 && element.readyState >= 2);
           }
+
+          // Only meaningful before the WHEP handover and only for the HLS
+          // pipeline; a fallback already in progress owns the lane from here.
+          if (!fallbackStarted && manifestParsed && playback.state === "live") {
+            const stalledMs = watchdogStalled();
+            if (stalledMs > 0) {
+              if (!watchdogRetried) {
+                watchdogRetried = true;
+                debugLogSample("player", {
+                  event: "watchdog-retry",
+                  idleMs: Math.round(stalledMs),
+                  firstFrag: Boolean(firstFragAt),
+                  readyState: element.readyState,
+                });
+                // Same restart as the fatal-network path before
+                // manifestParsed: startLoad() cannot revive a silently
+                // dead pipeline, only loadSource() re-issues the manifest.
+                hls?.loadSource(source);
+                lastActivityAt = performance.now();
+                lastProgressTime = element.currentTime;
+              } else {
+                debugLogSample("player", {
+                  event: "watchdog-fallback",
+                  idleMs: Math.round(performance.now() - lastActivityAt),
+                });
+                void startWhepFallback();
+              }
+            }
+          }
+
+          debugLogSample("player", {
+            t: Math.round((performance.now() - statsStart) / 100) / 10,
+            levelBitrate: level?.bitrate ?? null,
+            levelIndex: hls?.currentLevel ?? null,
+            bwEstimateMbps: Math.round(bwEstimate / 1000) / 1000,
+            bytesPerSecond,
+            bytesReceived,
+            latency: liveLatency === null ? null : Math.round(liveLatency * 100) / 100,
+            buffered: Math.round(buffered * 100) / 100,
+            live: playback.state === "live",
+          });
+
+          if (swarm) {
+            const swarmStats = swarm.getStats();
+            debugLogSample("swarm", {
+              status: swarmStats.status,
+              peers: swarmStats.peers,
+              parent: swarmStats.parent ? swarmStats.parent.slice(0, 8) : null,
+              children: swarmStats.children,
+              cache: swarmStats.cacheEntries,
+              peerKb: Math.round(swarmStats.peerBytes / 1000),
+              originKb: Math.round(swarmStats.originBytes / 1000),
+              servedKb: Math.round(swarmStats.servedBytes / 1000),
+            });
+          }
         }, 1000);
       } catch (caught) {
         if (disposed) return;
@@ -338,6 +549,18 @@ export function Player({
       if (statsTimer) clearInterval(statsTimer);
       hls?.destroy();
       hlsRef.current = null;
+      if (whepReportTimer) {
+        clearInterval(whepReportTimer);
+        whepReportTimer = null;
+      }
+      if (whep && whepSessionId) {
+        // Release the metered API session before tearing down the peer.
+        void fetch(
+          `${resolveApiPath(`/api/streams/${streamId}/whep`)}?sid=${encodeURIComponent(whepSessionId)}`,
+          { method: "DELETE", keepalive: true },
+        ).catch(() => undefined);
+      }
+      whepSessionId = "";
       whep?.close();
       whep = null;
       swarm?.destroy();
